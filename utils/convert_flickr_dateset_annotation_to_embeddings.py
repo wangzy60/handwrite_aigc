@@ -79,26 +79,25 @@ def save_index_and_name_dict_to_json_file(index_to_name_dict, memmap_info, save_
 
 
 if __name__ == "__main__":
-    device = "cuda:3"
-    annotation_file_path = "./dataset/flickr30kr/results.csv"
-    embeddings_save_path = "./dataset/flickr30kr/results"
-    index_and_name_dict_save_path = "./dataset/flickr30kr/results.json"
-    clip_model_dir = "./checkpoint/clip-vit-base-patch32"
-    file_name_2_annotations_dict = get_image_name_and_annotations_dict(annotation_file_path)
-    embeddings_array, index_to_name_dict = transform_annotation_to_embedding(file_name_2_annotations_dict, model_path = clip_model_dir, device = device)
-    memmap_info = save_embedding_to_memmap(embeddings_array, embeddings_save_path+'.npz')
-    save_index_and_name_dict_to_json_file(index_to_name_dict, memmap_info, index_and_name_dict_save_path)
+    # device = "cuda:3"
+    # annotation_file_path = "/data1/zhenyu/hand_write_aigc/dataset/flickr30kr/flickr30k_images_512_test/annotations/results.csv"
+    # embeddings_save_path = "/data1/zhenyu/hand_write_aigc/dataset/flickr30kr/flickr30k_images_512_test/annotations/results"
+    # index_and_name_dict_save_path = "/data1/zhenyu/hand_write_aigc/dataset/flickr30kr/flickr30k_images_512_test/annotations/results.json"
+    # clip_model_dir = "/data1/zhenyu/hand_write_aigc/checkpoint/clip-vit-base-patch32"
+    # file_name_2_annotations_dict = get_image_name_and_annotations_dict(annotation_file_path)
+    # embeddings_array, index_to_name_dict = transform_annotation_to_embedding(file_name_2_annotations_dict, model_path = clip_model_dir, device = device)
+    # memmap_info = save_embedding_to_memmap(embeddings_array, embeddings_save_path+'.npz')
+    # save_index_and_name_dict_to_json_file(index_to_name_dict, memmap_info, index_and_name_dict_save_path)
 
-    # annotation_file_path = "/shared_file/hand_write_aigc/dataset/flickr30kr/results.csv"
-    # inputs = ["a photo of a dog"]
-    # model_name = "./checkpoint/clip-vit-base-patch32"
-    # device = "cpu"
-    # text_model = AutoModel.from_pretrained(model_name).text_model.to(device)
-    # tokenize = AutoTokenizer.from_pretrained(model_name)
-    # tokens = tokenize(inputs, padding="max_length", max_length=77, return_tensors = "pt").to(device)
-    # print(tokens)
-    # with torch.no_grad():
-    #     embeddings = text_model(**tokens)
-    # print(embeddings.last_hidden_state.shape)
-    # print(embeddings.last_hidden_state)
+    inputs = [""]
+    model_name = "./checkpoint/clip-vit-base-patch32"
+    device = "cpu"
+    text_model = AutoModel.from_pretrained(model_name).text_model.to(device)
+    tokenize = AutoTokenizer.from_pretrained(model_name)
+    tokens = tokenize(inputs, padding="max_length", max_length=77, return_tensors = "pt").to(device)
+    print(tokens)
+    with torch.no_grad():
+        embeddings = text_model(**tokens)
+    print(embeddings.last_hidden_state.shape)
+    print(embeddings.last_hidden_state)
     # print(embeddings.pooler_output.shape)
