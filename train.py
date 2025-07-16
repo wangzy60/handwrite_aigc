@@ -173,18 +173,14 @@ class DDPM_Flickr30K_CLIP_Dataset(torch.utils.data.Dataset):
         self.embeddings_drop_ratio = 0.1
 
         #标注相关
-        self.annotation_dir = os.path.join(dataset_fold, "annotations")
-        self.anno_csv_path = glob(os.path.join(self.annotation_dir, '*.csv'))
-        assert len(self.anno_csv_path) == 1, f'{self.annotation_dir}下有多个csv文件或缺失csv文件'
-        self.anno_csv_path = self.anno_csv_path[0]  #标注信息原始数据
+        self.train_images = glob(os.path.join(self.dataset_fold, '*.json'))
+        assert len(self.train_images) == 1, f'{self.annotation_dir}下有多个json文件或缺失json文件'
+        self.train_images = self.train_images[0]  #1、标注embedding数据的形状、数据类型信息，2、图像名称和索引对于关系
 
-        self.anno_npz_path = glob(os.path.join(self.annotation_dir, '*.npz'))
-        assert len(self.anno_npz_path) == 1, f'{self.annotation_dir}下有多个npz文件或缺失npz文件'
-        self.anno_npz_path = self.anno_npz_path[0]  #标注信息转换成的embedding数据，np.memmap格式
+        self.anno_csv_path = "./dataset/flickr30kr/flickr30k_annotations/all_raw_annotations.csv"  #标注信息原始数据
+        self.anno_npz_path = "./dataset/flickr30kr/flickr30k_annotations/all_embedding_annotations.npz"  #标注信息转换成的embedding数据，np.memmap格式
         
-        self.anno_json_path = glob(os.path.join(self.annotation_dir, '*.json'))
-        assert len(self.anno_json_path) == 1, f'{self.annotation_dir}下有多个json文件或缺失json文件'
-        self.anno_json_path = self.anno_json_path[0]  #1、标注embedding数据的形状、数据类型信息，2、图像名称和索引对于关系
+
 
         #图像相关
         self.image_dir = os.path.join(dataset_fold, "images")
@@ -203,22 +199,22 @@ class DDPM_Flickr30K_CLIP_Dataset(torch.utils.data.Dataset):
 
 
     def load_annotation(self):
-        with open(self.anno_json_path, 'r', encoding='utf-8') as f:
+        with open(self.train_images, 'r', encoding='utf-8') as f:
             json_content = json.load(f)
             if "memmap_info" in json_content and "image_index_to_name" in json_content:
                 embedding_info = json_content["memmap_info"]
                 image_index_to_name = json_content["image_index_to_name"]
             else:
-                raise ValueError(f'{self.anno_json_path}文件中memmap_info字段或image_index_to_name字段缺失，无法加载{self.anno_npz_path}文件')
+                raise ValueError(f'{self.train_images}文件中memmap_info字段或image_index_to_name字段缺失，无法加载{self.anno_npz_path}文件')
         
         if embedding_info and ("embedding_shape" in embedding_info) and ("embedding_dtype" in embedding_info):
             self.embeddings_shape = tuple(embedding_info["embedding_shape"])
             self.embeddings_dtype = embedding_info["embedding_dtype"]
         else:
-            raise ValueError(f'{self.anno_json_path}文件中memmap_info字段缺失embedding_shape和embedding_dtype两个字段，无法加载{self.anno_npz_path}文件')
+            raise ValueError(f'{self.train_images}文件中memmap_info字段缺失embedding_shape和embedding_dtype两个字段，无法加载{self.anno_npz_path}文件')
         
         if self.embeddings_shape[1:] != (self.every_image_n_annotations, self.max_token_num, self.embeddings_dim) or self.embeddings_dtype not in ["float32", "float16"]:
-            raise ValueError('f{self.anno_json_path}文件中memmap_info字段下的形状或数据类型与预期不匹配，无法加载{self.anno_npz_path}文件')
+            raise ValueError('f{self.train_images}文件中memmap_info字段下的形状或数据类型与预期不匹配，无法加载{self.anno_npz_path}文件')
         
         self.embeddings_dtype = np.float16 if self.embeddings_dtype == "float16" else np.float32
         self.embeddings = np.memmap(self.anno_npz_path, dtype=self.embeddings_dtype, mode='r', shape=self.embeddings_shape)
@@ -317,10 +313,8 @@ class DDPM_Flickr30K_Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):
         super().__init__()
         self.dataset_fold = dataset_fold
-
         #图像相关
-        self.image_dir = os.path.join(dataset_fold, "images")
-        self.image_paths = glob(os.path.join(self.image_dir, "*.jpg"))[:180]
+        self.image_paths = glob(os.path.join(self.dataset_fold, "*.jpg"))
         self.transform = transform
         self.total_steps = total_steps
         self.shift_func = shift_func
@@ -638,14 +632,18 @@ def ddpm1_inference(args, net=Unet):
         image_list = []
         image_save_taggle = total_steps
         x_t = torch.randn(batch_size, 3, args.input_image_size, args.input_image_size).to(device)
-        # embeddings = clip_vit_base_patch32_model_infer(ddpm_prompt_list, device)
+        if ddpm_prompt_list:
+            embeddings = clip_vit_base_patch32_model_infer(ddpm_prompt_list, device)
         image_name = f"infer_gap_{denoise_steps_gap}.jpg"
         image_save_path = os.path.join(inference_image_save_fold, image_name)
         time_schedule = list(range(total_steps-1, -1, -1 * denoise_steps_gap))
         #ddpm
         for t in tqdm(time_schedule):
             time_step = torch.tensor([t]*batch_size).to(device)
-            predict_noise = model(x_t, time_step)
+            if ddpm_prompt_list:
+                predict_noise = model(x_t, time_step, embeddings)
+            else:
+                predict_noise = model(x_t, time_step)
             a_t = alpha_t_list[t]
             b_t = beta_t_list[t]
             b_t_bar = beta_t_bar_list[t]
@@ -1348,10 +1346,9 @@ if __name__ == '__main__':
     argparse.add_argument("--ddpm_prompt_list", nargs='+', help="list of ddpm prompt")
     args = argparse.parse_args()
 
-
     if args.mode == "ddpm_train" or args.mode == "multi_gpu_ddpm_train" or args.mode == "multi_gpu_vae_train":
         rank = os.environ.get("RANK", None)
-        save_ckpt = False
+        save_ckpt = True
         if rank is None or int(rank) == 0:
             #启动日志
             current_time = datetime.datetime.now()
