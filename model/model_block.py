@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-
 def init_ddpm_params(model):
     if isinstance(model, (nn.Conv2d, nn.Linear)):
         nn.init.kaiming_normal_(model.weight, mode='fan_in', nonlinearity="relu")
@@ -180,6 +178,21 @@ class conv_block(nn.Module):
         return self.conv(x)
 
 
+class conv_first_block(nn.Module):
+    def __init__(self, input_dim, out_dim, image_size, activate_func_name):
+        super().__init__()
+        if input_dim >= 32:
+            self.conv = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=input_dim),
+                                      nn.Conv2d(input_dim, out_dim, kernel_size=3, stride=1, padding=1),
+                                      get_activate_func(activate_func_name))
+        else:
+            self.conv = nn.Sequential(nn.Conv2d(input_dim, out_dim, kernel_size=3, stride=1, padding=1),
+                                      get_activate_func(activate_func_name))            
+    
+    def forward(self, x):
+        return self.conv(x)
+
+
 class conv_block_acti_func_forward(nn.Module):
     def __init__(self, input_dim, out_dim, image_size, activate_func_name):
         super().__init__()
@@ -216,6 +229,17 @@ class conv_downsampling(nn.Module):
         super().__init__()
         self.activate_func_name = activate_func_name
         self.conv = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=input_channel),
+                                  nn.Conv2d(input_channel, input_channel, kernel_size=3, stride=2, padding=1),
+                                  get_activate_func(activate_func_name))
+
+    def forward(self, x):
+        return self.conv(x)
+    
+class vae_conv_downsampling(nn.Module):
+    def __init__(self, input_channel, activate_func_name):
+        super().__init__()
+        self.activate_func_name = activate_func_name
+        self.conv = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=input_channel),
                                   get_activate_func(activate_func_name),
                                   nn.Conv2d(input_channel, input_channel, kernel_size=3, stride=2, padding=1))
 
@@ -234,6 +258,19 @@ class upsampling(nn.Module):
     
 
 class bilinear_upsampling_block(nn.Module):
+    def __init__(self, input_channel, activate_func_name):
+        super().__init__()
+        self.activate_func_name = activate_func_name
+        self.upsample = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear'),
+                                      nn.GroupNorm(num_groups=32, num_channels=input_channel),
+                                      nn.Conv2d(input_channel, input_channel, kernel_size=3, stride=1, padding=1),
+                                      get_activate_func(activate_func_name))
+    
+    def forward(self, x):
+        return self.upsample(x)
+    
+
+class vae_bilinear_upsampling_block(nn.Module):
     def __init__(self, input_channel, activate_func_name):
         super().__init__()
         self.activate_func_name = activate_func_name
@@ -283,19 +320,18 @@ class residual_block_with_cross_attation(nn.Module):
         super().__init__()
         self.activate_func_name = activate_func_name
         self.conv1 = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=input_dim),
-                                  get_activate_func(activate_func_name),
                                   nn.Conv2d(input_dim, out_dim, kernel_size=3, stride=1, padding=1))
-        self.attation = image_text_multihead_cross_attation_block(out_dim, text_embedding_dim, text_embedding_dim, out_dim, out_dim)
         self.conv2 = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=out_dim),
-                                  get_activate_func(activate_func_name),
                                   nn.Conv2d(out_dim, out_dim, kernel_size=3, stride=1, padding=1))
+        self.attation = image_text_multihead_cross_attation_block(out_dim, text_embedding_dim, text_embedding_dim, out_dim, out_dim)
+        self.activation =  get_activate_func(activate_func_name)
         self.resdital = nn.Identity() if input_dim == out_dim else nn.Conv2d(input_dim, out_dim, kernel_size=1, stride=1)
 
     def forward(self, input_img, txt_embedding):
         img = self.conv1(input_img)
-        text = self.attation(img, txt_embedding, txt_embedding)
-        img = img + text
         img = self.conv2(img)
+        img = self.attation(img, txt_embedding, txt_embedding)
+        img = self.activation(img)
         return self.resdital(input_img) + img
 
     
@@ -420,6 +456,7 @@ class image_text_multihead_cross_attation_block(nn.Module):
         # kv:text(batch, text_seq, text_emb)
         heads = self.heads
         latent_dim = self.latent_dim
+        input_img = q
         q = self.q_norm(q)
         k = self.k_norm(k)
         v = self.v_norm(v)
@@ -438,7 +475,7 @@ class image_text_multihead_cross_attation_block(nn.Module):
         x = torch.matmul(attation_score, v) # b, head, img_seq, text_seq @ b, head, text_seq, latent_dim//head -> b, head, img_seq, latent_dim//head
         x = x.permute(0, 2, 1, 3).reshape(batch_size, img_seq, -1) # b, head, img_seq, latent_dim//head -> b, img_seq, head, latent_dim//head -> b, img_seq, latent_dim
         x = self.latent_to_out(x).permute(0,2,1).reshape(*q_shape) #b, img_seq, latent_dim -> b, img_seq, out_dim -> b, out_dim, img_seq -> b, c, h, w
-        return x
+        return input_img + x
 
 
 

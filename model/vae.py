@@ -6,7 +6,8 @@ class KL_VAE(nn.Module):
         #KL_VAE中使用的attation模块存在问题，这个版本使用image_multihead_attation_block
         super().__init__()
         img_h = args.input_image_size
-        img_in_dim = args.input_image_dims
+        # img_in_dim = args.input_image_dims
+        img_in_dim = 3
         acti_func = args.train_activate_func
 
         self.encoder = nn.Sequential(
@@ -15,9 +16,9 @@ class KL_VAE(nn.Module):
 
                                     #downsample_block
                                     nn.Sequential(residual_block_acti_func_forward(128, 128, int(img_h/1), acti_func),
-                                                residual_block_acti_func_forward(128, 256, int(img_h/2), acti_func),conv_downsampling(256, acti_func),
-                                                residual_block_acti_func_forward(256, 256, int(img_h/4), acti_func),conv_downsampling(256, acti_func),
-                                                residual_block_acti_func_forward(256, 512, int(img_h/8), acti_func),conv_downsampling(512, acti_func)),
+                                                residual_block_acti_func_forward(128, 256, int(img_h/2), acti_func),vae_conv_downsampling(256, acti_func),
+                                                residual_block_acti_func_forward(256, 256, int(img_h/4), acti_func),vae_conv_downsampling(256, acti_func),
+                                                residual_block_acti_func_forward(256, 512, int(img_h/8), acti_func),vae_conv_downsampling(512, acti_func)),
                                      
                                      #encoder_middle_block
                                      nn.Sequential(residual_block_acti_func_forward(512, 512, int(img_h/8), acti_func),
@@ -37,9 +38,9 @@ class KL_VAE(nn.Module):
                                                   residual_block_acti_func_forward(512, 512, int(img_h/8), acti_func)),
                                     #upsample_block
                                     nn.Sequential(residual_block_acti_func_forward(512, 256, int(img_h/8), acti_func), 
-                                                residual_block_acti_func_forward(256, 256, int(img_h/4), acti_func), bilinear_upsampling_block(256, acti_func),
-                                                residual_block_acti_func_forward(256, 128, int(img_h/2), acti_func), bilinear_upsampling_block(128, acti_func),
-                                                residual_block_acti_func_forward(128, 128, int(img_h/1), acti_func), bilinear_upsampling_block(128, acti_func)),
+                                                residual_block_acti_func_forward(256, 256, int(img_h/4), acti_func), vae_bilinear_upsampling_block(256, acti_func),
+                                                residual_block_acti_func_forward(256, 128, int(img_h/2), acti_func), vae_bilinear_upsampling_block(128, acti_func),
+                                                residual_block_acti_func_forward(128, 128, int(img_h/1), acti_func), vae_bilinear_upsampling_block(128, acti_func)),
                                     #decoder_output_block
                                     nn.Sequential(conv_block_acti_func_forward(128, img_in_dim, int(img_h/1), acti_func),
                                                   nn.Tanh())

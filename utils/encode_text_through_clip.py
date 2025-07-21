@@ -5,6 +5,7 @@ from tqdm import tqdm
 from glob import glob
 import numpy as np
 import json
+from utils.utils import save_embedding_to_memmap
 
 def get_image_name_and_annotations_dict(annotation_file_path):
     file_name_2_annotations_dict = {}
@@ -44,30 +45,6 @@ def transform_annotation_to_embedding(file_name_2_annotations_dict, model_path =
     embeddings_array = np.stack(embeddings_list, axis = 0)
     return embeddings_array, index_to_name_dict
 
-def save_embedding_to_memmap(embedding_array, save_path):
-    max_num = np.max(embedding_array)
-    min_num = np.min(embedding_array)
-    print(f"embedding最大值为{max_num},最小值为{min_num}")
-    if (max_num < 65504) and (min_num > -65504):
-        print(f"符合float16值域要求，将embedding转换为float16类型存储，以节约空间")
-        embedding_dtype = np.float16
-    else:
-        print(f"不符合float16值域要求，embedding将以float32类型存储")
-        embedding_dtype = np.float32
-    print("使用np.memmap存储，避免使用时占用过多内存")
-    memmap = np.memmap(save_path, dtype=embedding_dtype, mode='w+', shape=embedding_array.shape)
-    chunk_size = embedding_array.shape[0] if embedding_array.shape[0] < 5000 else 5000
-    for i in range(0, embedding_array.shape[0], chunk_size):
-        memmap[i:i + chunk_size] = embedding_array[i:i + chunk_size]
-    memmap.flush()
-    del memmap  # 关闭内存映射
-    print(f'embeddings保存成功，保存路径为：{save_path}')
-
-    memmap_info = {
-        "embedding_shape": list(embedding_array.shape),
-        "embedding_dtype": str(embedding_dtype.__name__)
-    }
-    return memmap_info
 
 def save_index_and_name_dict_to_json_file(index_to_name_dict, memmap_info, save_path):
     save_dict_content = {}

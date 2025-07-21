@@ -1,6 +1,4 @@
 import torch.distributed
-from utils.utils import get_device
-from utils.ddpm_schedule import alpha_t_list,alpha_t_bar_list,beta_t_list,beta_t_bar_list
 import torch
 import json
 import torch.nn as nn
@@ -21,12 +19,17 @@ import random
 import math
 import matplotlib.pyplot as plt
 from pathlib import Path
-# from model.unet import Unet_With_Text_Condition as Unet
-from model.unet import Unet_Without_Condition as Unet
+
+from model.unet import Unet_With_Text_Condition as Unet
+# from model.unet import Unet_Without_Condition as Unet
 # from model.unet import Unet2 as Unet
-
 from model.vae import KL_VAE as VAE
-
+from model.my_lpips_loss import LPIPS 
+from model.dataset import DDPM_Flickr30K_CLIP_Dataset, LDM_Flickr30K_CLIP_Dataset
+from utils.ddpm_schedule import add_noise
+from utils.utils import clip_vit_base_patch32_model_infer
+from utils.utils import get_device, get_image_transformer, detransform_tensor2image, ldm_load_model
+from utils.ddpm_schedule import alpha_t_list,alpha_t_bar_list,beta_t_list,beta_t_bar_list
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -35,10 +38,9 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from torchvision.models import inception_v3
-from torchvision.models import vgg16
 import lpips
-from checkpoint.lpips_weights import lpips_offical_weights
 from scipy.linalg import sqrtm
+
 
 #绘制最近一个epoch的损失曲线:done
 #学习率调度:done
@@ -109,21 +111,6 @@ def test_computer_fid_loss(args):
     from pytorch_fid import fid_score
     fid_loss = fid_score.calculate_fid_given_paths(["/shared_file/hand_write_aigc/dataset/test1", "/shared_file/hand_write_aigc/dataset/test2"], batch_size=batch_size, device=device, dims=2048)
     print(f"FID损失为：{fid_loss:.4f}")
-    
-    
-
-def add_noise(x, t, shift_func, noise_func, verbose=False):
-    if isinstance(shift_func, np.ndarray) and isinstance(noise_func, np.ndarray):
-        shift_value = shift_func[t]
-        noise_value = noise_func[t]
-    else:
-        shift_value = shift_func(t)
-        noise_value = noise_func(t)
-        
-    noise = torch.randn_like(x)
-    noise_img = noise_value*noise
-    img_with_noisy = shift_value*x + noise_img
-    return img_with_noisy, noise_img, noise
 
 
 class DDPM1_Dataset(torch.utils.data.Dataset):
@@ -150,164 +137,6 @@ class DDPM1_Dataset(torch.utils.data.Dataset):
         img_with_noisy, noise_img, noise = self.add_noise(image, t)
         return img_with_noisy, t, noise
 
-
-def clip_vit_base_patch32_model_infer(input_words_list, device='cpu'):
-    from transformers import AutoModel, AutoTokenizer
-    model_name = "./checkpoint/clip-vit-base-patch32"
-    text_model = AutoModel.from_pretrained(model_name).text_model.to(device)
-    tokenize = AutoTokenizer.from_pretrained(model_name)
-    tokens = tokenize(input_words_list, padding="max_length", max_length=77, return_tensors = "pt").to(device)
-    with torch.no_grad():
-        embeddings = text_model(**tokens)
-    clip_result = embeddings.last_hidden_state.detach()
-    return clip_result
-
-
-class DDPM_Flickr30K_CLIP_Dataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):
-        super().__init__()
-        self.dataset_fold = dataset_fold
-        self.every_image_n_annotations = 5
-        self.max_token_num = 77
-        self.embeddings_dim = 512
-        self.embeddings_drop_ratio = 0.1
-
-        #标注相关
-        self.train_images = glob(os.path.join(self.dataset_fold, '*.json'))
-        assert len(self.train_images) == 1, f'{self.annotation_dir}下有多个json文件或缺失json文件'
-        self.train_images = self.train_images[0]  #1、标注embedding数据的形状、数据类型信息，2、图像名称和索引对于关系
-
-        self.anno_csv_path = "./dataset/flickr30kr/flickr30k_annotations/all_raw_annotations.csv"  #标注信息原始数据
-        self.anno_npz_path = "./dataset/flickr30kr/flickr30k_annotations/all_embedding_annotations.npz"  #标注信息转换成的embedding数据，np.memmap格式
-        
-
-
-        #图像相关
-        self.image_dir = os.path.join(dataset_fold, "images")
-        self.image_paths = []
-        self.transform = transform
-        self.total_steps = total_steps
-        self.shift_func = shift_func
-        self.noise_func = noise_func
-
-        logging.info("-----开始加载并检查标注embeddings数据-----")
-        self.load_annotation()
-        self.load_image_paths()
-        self.check_annotation()
-        self.empty_text_embeddings = self.get_empty_text_embeddings()
-        logging.info("-----数据加载完毕，所有检查通过-----")
-
-
-    def load_annotation(self):
-        with open(self.train_images, 'r', encoding='utf-8') as f:
-            json_content = json.load(f)
-            if "memmap_info" in json_content and "image_index_to_name" in json_content:
-                embedding_info = json_content["memmap_info"]
-                image_index_to_name = json_content["image_index_to_name"]
-            else:
-                raise ValueError(f'{self.train_images}文件中memmap_info字段或image_index_to_name字段缺失，无法加载{self.anno_npz_path}文件')
-        
-        if embedding_info and ("embedding_shape" in embedding_info) and ("embedding_dtype" in embedding_info):
-            self.embeddings_shape = tuple(embedding_info["embedding_shape"])
-            self.embeddings_dtype = embedding_info["embedding_dtype"]
-        else:
-            raise ValueError(f'{self.train_images}文件中memmap_info字段缺失embedding_shape和embedding_dtype两个字段，无法加载{self.anno_npz_path}文件')
-        
-        if self.embeddings_shape[1:] != (self.every_image_n_annotations, self.max_token_num, self.embeddings_dim) or self.embeddings_dtype not in ["float32", "float16"]:
-            raise ValueError('f{self.train_images}文件中memmap_info字段下的形状或数据类型与预期不匹配，无法加载{self.anno_npz_path}文件')
-        
-        self.embeddings_dtype = np.float16 if self.embeddings_dtype == "float16" else np.float32
-        self.embeddings = np.memmap(self.anno_npz_path, dtype=self.embeddings_dtype, mode='r', shape=self.embeddings_shape)
-
-        self.image_index_to_name = image_index_to_name
-        logging.info("标注embeddings数据加载完成")
-
-
-    def load_image_paths(self):
-        logging.info("开始检查标注文件中图片是否都存在")
-        img_name_list = list(self.image_index_to_name.values())
-        for img_name in tqdm(img_name_list):
-            img_path = os.path.join(self.image_dir, img_name)
-            if not os.path.isfile(img_path):
-                self.image_paths = []
-                raise ValueError(f"图片{img_path}不存在，请检查")
-            else:
-                self.image_paths.append(img_path)
-        logging.info("图片名字和索引对照表检查通过")
-
-        logging.info(f'数据集加载了目录{self.dataset_fold}下的{len(self.image_paths)}张图像')
-        logging.info(f'前20张图像地址为：{self.image_paths[:20] if len(self.image_paths) > 20 else self.image_paths}')
-
-
-    def random_check_embeddings(self, input_words_list, input_embedding):
-        clip_result = clip_vit_base_patch32_model_infer(input_words_list, device='cpu')
-        clip_result = clip_result.squeeze().numpy().astype(self.embeddings_dtype)
-        input_embedding = input_embedding.squeeze()
-        logging.info(f"随机选取的标注内容：{input_words_list}")
-        logging.info(f"实际结果：{clip_result}")
-        logging.info(f"读取内容：{input_embedding}")
-        if np.any(abs(clip_result-input_embedding) > 1e-2):
-            return False
-        else:
-            return True
-    
-    def get_empty_text_embeddings(self):
-        input_words_list = [""]
-        logging.info("f开始使用{input_words_list}获取空文本embeddings")
-        clip_result = clip_vit_base_patch32_model_infer(input_words_list, device='cpu')
-        clip_result = clip_result.squeeze().numpy()
-        if clip_result.shape != (self.max_token_num, self.embeddings_dim):
-            raise ValueError(f"获取空文本embeddings失败，返回的embedding维度为{clip_result.shape}，不是{self.max_token_num, self.embeddings_dim}")
-        else:
-            logging.info(f"获取空文本embeddings成功，返回的空文本embedding的值为{clip_result}")
-        return clip_result
-
-
-    def check_annotation(self):
-        #随机选取一个标注，检查其内容是否和clip的原始输出内容一致
-        logging.info("开始检查随机选取的一个标注是否和clip的原始输出内容一致")
-        random_image_index = random.randint(0, len(self.image_index_to_name.keys())-1)
-        random_anno_index = random.randint(0,self.every_image_n_annotations-1)
-        random_image_name = self.image_index_to_name[str(random_image_index)]
-        annotation = None
-        with open(self.anno_csv_path, 'r', encoding='utf-8') as f:
-            csv_content = f.readlines()
-            for i in range(len(csv_content)):
-                if csv_content[i].startswith(random_image_name):
-                    annotation = csv_content[i + random_anno_index]
-                    annotation = annotation.split("|")[-1].replace("\n", " ").strip()
-                    break
-        if annotation is None:
-            raise ValueError("没有找到随机的图片及其对应的标注, 请检查代码")
-
-        input_embedding = self.embeddings[random_image_index][random_anno_index]
-        input_words_list = [annotation]
-
-        if self.random_check_embeddings(input_words_list, input_embedding):
-            logging.info(f"随机选取的图片为：{random_image_name}，随机选取的标注为:{annotation}，和clip的原始输出内容一致")
-        else:
-            raise ValueError("数据检查失败")        
-
-    def __len__(self):
-        return len(self.image_paths)
-    
-    def add_noise(self, x, t, verbose=False):
-        return add_noise(x, t, self.shift_func, self.noise_func, verbose=verbose)
-
-    def __getitem__(self, index):
-        image_path = self.image_paths[index]
-        image = Image.open(image_path)
-        if self.transform is not None:
-            image = self.transform(image)
-        t = torch.randint(0, self.total_steps, (1,))  #torch.randint不包含最后一个数
-        img_with_noisy, _, noise = self.add_noise(image, t)
-        if random.random() > self.embeddings_drop_ratio:
-            picture_annotation_embedding = self.embeddings[index][random.randint(0, self.every_image_n_annotations-1)]
-        else:
-            picture_annotation_embedding = self.empty_text_embeddings
-        picture_annotation_embedding = torch.tensor(picture_annotation_embedding, dtype=torch.float)
-        return img_with_noisy, t, noise, picture_annotation_embedding
-    
 
 class DDPM_Flickr30K_Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):
@@ -388,52 +217,6 @@ class VAE_Dataset(torch.utils.data.Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image
-
-
-class ResizeAutoPad:
-    def __init__(self, target_size=512, fill=(128, 128, 128)):
-        self.target_size = target_size
-        self.fill = fill
-
-    def __call__(self, img):
-        img_w, img_h = img.size
-        if (img_h == self.target_size) and (img_w == self.target_size):
-            return img
-        scalar = self.target_size / max(img_h, img_w)
-        target_h, target_w = int(img_h * scalar), int(img_w * scalar)
-        img = transforms.functional.resize(img, (target_h, target_w), interpolation=Image.LANCZOS)
-        img_w, img_h = img.size
-        padded_img = Image.new("RGB", (self.target_size, self.target_size), self.fill)
-        paste_x = (self.target_size - img_w) // 2
-        paste_y = (self.target_size - img_h) // 2        
-        padded_img.paste(img, (paste_x, paste_y))
-        return padded_img
-
-
-def get_image_transformer(image_size):
-    transform = transforms.Compose([
-        ResizeAutoPad(target_size= image_size, fill=(128, 128, 128)),
-        transforms.ToTensor(),
-        # transforms.Lambda(lambda x: (x - 0.5) * 4)
-        transforms.Lambda(lambda x: x * 2 - 1)  #一般将图片的值域范围处理到[-1,1]
-    ])
-    return transform
-
-def detransform_tensor2image(image_tensor):
-    #image_tensor(c,h,w) / (b, c, h, w)
-
-    # image_numpy = ((image_tensor / 4.0 + 0.5) * 255.0).to(torch.uint8).numpy()
-    image_tensor = torch.clamp(image_tensor, min=-1, max=1)  #这里需要做显示的值域控制，因为torch的.to(torch.uint8)操作不会对溢出的部分进行处理，比如256使用to(torch.uint8)会得到0而不是255
-    image_numpy = ((image_tensor + 1) * 255 / 2).to(torch.uint8).numpy()  
-    if len(image_tensor.shape) == 3:
-        image = Image.fromarray(image_numpy.transpose(1,2,0))
-        return image
-    elif len(image_tensor.shape) == 4:
-        image_numpy = image_numpy.transpose(0,2,3,1)
-        image_list = [Image.fromarray(img.squeeze()) for img in image_numpy]
-        return image_list
-    else:
-        raise ValueError(f"去噪图片的tensor形状必须是3维或者4维，否则无法转换，当前维度为{len(image_tensor.shape)}")
 
 
 def show_image_with_noise(image_path, max_t, iter_gap, shift_func, noise_func, save_image= True, verbose = False, image_save_path = None, noise_save_path = None):
@@ -556,27 +339,6 @@ def ddpm1_train(args, net=Unet):
         plot_training_loss(loss_img_save_path, epoch_list, batch_list, loss_list)
             
 
-def ddpm_load_model(model_path, net):
-    saved_params = torch.load(model_path, weights_only=False)
-    print(saved_params)
-    model_params = saved_params.get('model_state_dict', None)
-    if model_params is None:
-        raise ValueError("No state_dict found in the checkpoint file.")
-    
-    # 兼容多卡训练的模型。多卡训练的模型外面会多包裹一层'module.'， 去除key中的'module.'
-    new_model_params = {k.replace('module.', ''): v for k, v in model_params.items()}
-
-    model = net(args)
-    incompatiable = model.load_state_dict(new_model_params)  #返回的是不匹配的key，不是加载参数后的模型
-    if len(incompatiable.missing_keys) == 0 and len(incompatiable.unexpected_keys) == 0:
-        print(model)
-    elif incompatiable.missing_keys:
-        raise ValueError(f"缺失的key：{incompatiable.missing_keys}")
-    elif incompatiable.unexpected_keys:
-        raise ValueError(f"多余的key：{incompatiable.unexpected_keys}")       
-    return model
-
-
 def concatenate_images_horizontally(image_numpy_list):
     assert len(image_numpy_list) > 0, "image_numpy_list不能为空"
     image_num = len(image_numpy_list)
@@ -616,9 +378,10 @@ def ddpm1_inference(args, net=Unet):
     #支持同时推理多张图片
     device = get_device(args.device)
     total_steps = int(args.total_steps)
-    model_path = args.ckpt_path
+    model_path = args.unet_ckpt_path
 
-    model = ddpm_load_model(model_path, net).to(device)
+    model = net(args)
+    model = ldm_load_model(model_path, model).to(device)
     model.eval()
     
     infer_times = int(args.infer_times)
@@ -637,6 +400,7 @@ def ddpm1_inference(args, net=Unet):
         image_name = f"infer_gap_{denoise_steps_gap}.jpg"
         image_save_path = os.path.join(inference_image_save_fold, image_name)
         time_schedule = list(range(total_steps-1, -1, -1 * denoise_steps_gap))
+
         #ddpm
         for t in tqdm(time_schedule):
             time_step = torch.tensor([t]*batch_size).to(device)
@@ -690,6 +454,100 @@ def ddpm1_inference(args, net=Unet):
             concatenated_image = concatenate_images_horizontally(concatenated_image)
             concat_image_save_path = os.path.join(inference_image_save_fold, f"infer_gap_{denoise_steps_gap}_every_{inference_show_denoise_image_every_n_steps}_steps.png")
             concatenated_image.save(concat_image_save_path)
+
+
+
+def ldm_inference(args, unet=Unet, vae = VAE):
+    #支持同时推理多张图片
+    device = get_device(args.device)
+    total_steps = int(args.total_steps)
+    unet_model_path = args.unet_ckpt_path
+    vae_model_path = args.vae_ckpt_path
+    print("unet_model_path: ", unet_model_path)
+    print("vae_model_path: ", vae_model_path)
+
+    unet_model = unet(args)
+    unet_model = ldm_load_model(unet_model_path, unet_model).to(device)
+    unet_model.eval()
+    
+    vae_model = vae(args)
+    vae_decoder_model = ldm_load_model(vae_model_path, vae_model).decoder.to(device)
+    vae_decoder_model.eval()
+    
+    batch_size = int(args.batch_size)
+    ddpm_prompt_list = args.ddpm_prompt_list
+    denoise_steps_gap = int(args.denoise_steps_gap)
+    inference_image_save_fold = args.inference_image_save_fold
+    inference_show_denoise_image_every_n_steps = args.inference_show_denoise_image_every_n_steps
+    with torch.no_grad():
+        print("开始推理...")
+        image_list = []
+        image_save_taggle = total_steps
+        x_t = torch.randn(batch_size, 4, int(args.input_image_size), int(args.input_image_size)).to(device)
+        print("ddpm_prompt_list: " , ddpm_prompt_list)
+        if not ddpm_prompt_list:
+            ddpm_prompt_list = [""] * batch_size
+        embeddings = clip_vit_base_patch32_model_infer(ddpm_prompt_list, device)            
+        image_name = f"infer_gap_{denoise_steps_gap}.jpg"
+        image_save_path = os.path.join(inference_image_save_fold, image_name)
+        time_schedule = list(range(total_steps-1, -1, -1 * denoise_steps_gap))
+
+        #ddpm
+        for t in tqdm(time_schedule):
+            time_step = torch.tensor([t]*batch_size).to(device)
+            predict_noise = unet_model(x_t, time_step, embeddings)
+            a_t = alpha_t_list[t]
+            b_t = beta_t_list[t]
+            b_t_bar = beta_t_bar_list[t]
+            b_t_minus_one_bar = beta_t_bar_list[t-1] if t - 1 >= 0 else 0
+            sigma = b_t * b_t_minus_one_bar  / b_t_bar
+            # sigma = b_t
+            x_t = 1 / a_t * (x_t - b_t**2 / b_t_bar * predict_noise) + sigma * torch.randn_like(x_t)
+
+
+        
+        # ##ddim
+        # if time_schedule[-1] != 0:
+        #     time_schedule.append(0)
+        # for i in tqdm(range(len(time_schedule))):
+        #     t = time_schedule[i]
+        #     time_step = torch.tensor([t]*batch_size).to(device)
+        #     # predict_noise = model(x_t, time_step, embeddings)
+        #     predict_noise = model(x_t, time_step)
+        #     p_t = time_schedule[i+1] if i+1 < len(time_schedule) else None
+        #     a_t = float(alpha_t_bar_list[t])
+        #     a_pt = float(alpha_t_bar_list[p_t] if i+1 < len(time_schedule) else 1)
+        #     b_t = float(beta_t_bar_list[t])
+        #     b_pt = float(beta_t_bar_list[p_t] if i+1 < len(time_schedule) else 0)
+        #     sigma = torch.sqrt(torch.tensor(1.0) - (a_t**2)/(a_pt**2)) * b_pt  / b_t
+        #     x_t = (a_pt / a_t) * (x_t + (a_t*torch.sqrt(b_pt**2 - sigma**2)/a_pt - b_t) * predict_noise) + torch.randn_like(x_t) * sigma
+
+        #     #保存过程图片
+        #     if (inference_show_denoise_image_every_n_steps is not None) and (t < image_save_taggle):
+        #         image_save_taggle -= inference_show_denoise_image_every_n_steps
+        #         image_list.append(detransform_tensor2image(x_t.detach().cpu()))        
+
+        # vae decoder
+        mu = x_t * 0.8696986216297429  # 0.8696986216297429是flickr30K图片经过训练好的vae encoder之后输出的标准差，在训练ddpm时，对每个输入数据除以了这个数
+        std = 1
+        # latent_z = mu + std * torch.randn_like(mu)
+        latent_z = mu
+        pred_x = vae_decoder_model(latent_z)
+
+
+        #保存最终图片
+        image = detransform_tensor2image(pred_x.detach().cpu())
+        concatenated_image = concatenate_images_horizontally(image)
+        concatenated_image.save(image_save_path)
+        
+        # #保存过程图片
+        # if (inference_show_denoise_image_every_n_steps is not None):
+        #     image_list.append(image)
+        #     concatenated_image = [concatenate_images_vertical(image) for image in image_list]
+        #     concatenated_image = concatenate_images_horizontally(concatenated_image)
+        #     concat_image_save_path = os.path.join(inference_image_save_fold, f"infer_gap_{denoise_steps_gap}_every_{inference_show_denoise_image_every_n_steps}_steps.png")
+        #     concatenated_image.save(concat_image_save_path)
+
 
 
 def show_demoise_image():
@@ -781,7 +639,7 @@ def load_state_dict(state_dict, rank):
 def load_checkpoint(ckpt_path, model, optimizer, scheduler, rank):
     #rank 0 加载断点模型
     if rank == 0:
-        checkpoint_dict = torch.load(ckpt_path)
+        checkpoint_dict = torch.load(ckpt_path, weights_only=False)
         model_state_dict = checkpoint_dict["model_state_dict"]
         optimizer_state_dict = checkpoint_dict["optimizer_state_dict"]
         scheduler_state_dict = checkpoint_dict["scheduler_state_dict"]
@@ -847,16 +705,23 @@ def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
     total_steps = args.total_steps
     ddpm_dataset_fold = args.ddpm_dataset_fold
     image_transformer = get_image_transformer(args.input_image_size)
+
+    ddpm_dataset = LDM_Flickr30K_CLIP_Dataset(ddpm_dataset_fold, 
+                                                alpha_t_bar_list, 
+                                                beta_t_bar_list, 
+                                                total_steps=total_steps, 
+                                                transform=image_transformer)
+
     # ddpm_dataset = DDPM_Flickr30K_CLIP_Dataset(ddpm_dataset_fold, 
     #                                         alpha_t_bar_list, 
     #                                         beta_t_bar_list, 
     #                                         total_steps=total_steps, 
     #                                         transform=image_transformer)
-    ddpm_dataset = DDPM_Flickr30K_Dataset(ddpm_dataset_fold, 
-                                        alpha_t_bar_list, 
-                                        beta_t_bar_list, 
-                                        total_steps=total_steps, 
-                                        transform=image_transformer)
+    # ddpm_dataset = DDPM_Flickr30K_Dataset(ddpm_dataset_fold, 
+    #                                     alpha_t_bar_list, 
+    #                                     beta_t_bar_list, 
+    #                                     total_steps=total_steps, 
+    #                                     transform=image_transformer)
     sampler = DistributedSampler(
         ddpm_dataset,
         num_replicas=world_size,
@@ -886,7 +751,7 @@ def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
         
     # === 3. 恢复参数及随机状态 ===
     if args.resume_train:
-        ckpt_path = args.ckpt_path
+        ckpt_path = args.unet_ckpt_path
         assert os.path.exists(ckpt_path), f"恢复训练指定的ckpt文件：{ckpt_path} 不存在" 
         resume_epoch, best_loss, resume_global_steps = load_checkpoint(ckpt_path, model, optimizer, scheduler, rank)  
         logging.info(f"恢复训练，ckpt路径为: {ckpt_path}")
@@ -921,7 +786,7 @@ def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
             else:
                 raise ValueError(f"希望单个训练数据包含的元素为3或4，得到的元素数量为{len(batch)}，暂不支持")
 
-            local_rank_loss = F.mse_loss(predict_noise, noises, reduction="mean")
+            local_rank_loss = F.mse_loss(predict_noise, noises, reduction="sum") / len(predict_noise)  #以每张图片的平均损失作为损失值
 
             local_rank_loss.backward()
             local_loss_tensor = torch.tensor(local_rank_loss.item()).cuda(local_rank)
@@ -967,178 +832,12 @@ def count_model_params(model):
     return sum(param.numel() for param in model.parameters())
 
 
-def count_params(args):
-    model = Unet(args)
-    print(f"模型参数量为: {count_model_params(model)/1e9} B")
-    # from torchinfo import summary
-    # summary(model) 
-
-
-def load_vgg16_model(rank, n_layers=16):
-    if rank == 0:
-        vgg_model = vgg16(pretrained=True).features[:n_layers]
-        state_dict = vgg_model.state_dict()
-        object_list = [state_dict]
-    else:
-        vgg_model = vgg16(pretrained=False).features[:n_layers]
-        state_dict = None
-        object_list = [state_dict]
-
-    torch.distributed.broadcast_object_list(object_list, src=0)
-    torch.distributed.barrier()
-
-    if rank != 0:
-        state_dict = object_list[0]
-        vgg_model.load_state_dict(state_dict)
-
-    vgg_model.eval()
-    for param in vgg_model.parameters():
-        param.requires_grad_(False)
-    vgg_model = vgg_model.to(rank)
-    return vgg_model
-
-
 def computer_vae_kl_loss(mu, log_var, clamp = False):
     if clamp:
         log_var = torch.clamp(log_var, min=-20, max=20)
     return 0.5 * (mu.pow(2) + log_var.exp() -1 - log_var).mean()
     # return 0.5 * (mu.pow(2) + log_var.exp() -1 - log_var).sum(dim=(1,2,3)).mean()
 
-
-class LPIPS(nn.Module):
-    def __init__(self, rank, model_name, lpips_weights = lpips_offical_weights, yolox_weight_path = "./checkpoint/yolox_backbone.pth"):
-        super().__init__()
-        self.model_name = model_name
-        if model_name == "vgg16":
-            self.n_layers = 30
-            self.rank = rank
-            self.channel_weights_list = lpips_weights
-            if rank == 0:
-                vgg_model = vgg16(pretrained=True).features[:self.n_layers]
-                state_dict = vgg_model.state_dict()
-                object_list = [state_dict]
-            else:
-                vgg_model = vgg16(pretrained=False).features[:self.n_layers]
-                state_dict = None
-                object_list = [state_dict]
-
-            torch.distributed.broadcast_object_list(object_list, src=0)
-            torch.distributed.barrier()
-
-            if rank != 0:
-                state_dict = object_list[0]
-                vgg_model.load_state_dict(state_dict)
-
-            vgg_model.eval()
-            for param in vgg_model.parameters():
-                param.requires_grad_(False)
-            
-            children_model_list = list(vgg_model.children())
-            self.conv1 = nn.Sequential(*children_model_list[:4]).to(rank)
-            self.conv2 = nn.Sequential(*children_model_list[4:9]).to(rank)
-            self.conv3 = nn.Sequential(*children_model_list[9:16]).to(rank)
-            self.conv4 = nn.Sequential(*children_model_list[16:23]).to(rank)
-            self.conv5 = nn.Sequential(*children_model_list[23:30]).to(rank)
-            
-            assert len(self.channel_weights_list) == 5, "channel_weights_list的长度必须为5，以匹配5个特征层"
-            self.L = len(self.channel_weights_list)
-            
-            for i in range(len(self.channel_weights_list)):
-                self.channel_weights_list[i].requires_grad = False
-                self.channel_weights_list[i] = self.channel_weights_list[i].to(rank)
-        elif model_name == "yolox":
-            from model.yolox import CSPDarknet
-            self.yolox_model = CSPDarknet()
-            if rank == 0:
-                yolox_backbone_statedict = self.abstract_yolox_backbone_statedict(yolox_weight_path)
-                yolox_backbone_statedict_list = [yolox_backbone_statedict]
-            else:
-                yolox_backbone_statedict = None
-                yolox_backbone_statedict_list = [yolox_backbone_statedict]
-            torch.distributed.broadcast_object_list(yolox_backbone_statedict_list, src=0)
-            torch.distributed.barrier()
-            self.yolox_model.load_state_dict(yolox_backbone_statedict_list[0], strict=True)
-            self.yolox_model.eval()
-            for param in self.yolox_model.parameters():
-                param.requires_grad_(False)
-            self.yolox_model = self.yolox_model.to(rank)
-        else:
-            raise ValueError("model_name must be vgg16 or yolox, but got {}".format(model_name))
-
-    def abstract_yolox_backbone_statedict(self, pre_trained_model_path):
-        pre_trained_state_dict = torch.load(pre_trained_model_path)
-        pre_str = "backbone.backbone."
-        new_state_dict = {k.split(pre_str)[1]:v for k, v in pre_trained_state_dict['model'].items() if k.startswith(pre_str)}
-        return new_state_dict
-    
-    def vae_input_image_to_yolox_input_image(self, vae_input_image):
-        device = vae_input_image.device
-        yolox_input_image = ((vae_input_image + 1) * 0.5 * 255).to(device)
-        return yolox_input_image
-
-    def vae_input_image_to_vgg_input_image(self, vae_input_image):
-        device = vae_input_image.device
-        vgg_input_image = (vae_input_image + 1) * 0.5
-        vgg_input_image = (vgg_input_image - torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1).to(device))/torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1).to(device)
-        return vgg_input_image
-
-    def safe_L2_norm(self, input_tensor, epsilon = 1e-10):
-        scalar = torch.sqrt(torch.sum(input_tensor ** 2, dim=1, keepdim = True) + epsilon)
-        return input_tensor/scalar
-
-    def forward(self, input_image, pred_image):
-        if self.model_name == "vgg16":
-            #将图像像素值从[-1,1]转换成满足均值0方差1的正态分布，满足vgg的图像输入要求
-            vgg_input_image = self.vae_input_image_to_vgg_input_image(input_image)
-            vgg_pred_image = self.vae_input_image_to_vgg_input_image(pred_image)
-            #获取原图和重建图的多尺度特征图
-            input_feature1 = self.conv1(vgg_input_image)
-            input_feature2 = self.conv2(input_feature1)
-            input_feature3 = self.conv3(input_feature2)
-            input_feature4 = self.conv4(input_feature3)
-            input_feature5 = self.conv5(input_feature4)
-            input_image_feature_list = [input_feature1, input_feature2, input_feature3, input_feature4, input_feature5]
-            pred_feature1 = self.conv1(vgg_pred_image)
-            pred_feature2 = self.conv2(pred_feature1)
-            pred_feature3 = self.conv3(pred_feature2)
-            pred_feature4 = self.conv4(pred_feature3)
-            pred_feature5 = self.conv5(pred_feature4)
-            pred_image_feature_list = [pred_feature1, pred_feature2, pred_feature3, pred_feature4, pred_feature5]
-            #对所有特征在通道维度进行L2归一化
-            input_image_feature_l2_norm_list, pred_image_feature_l2_norm_list = [], []
-            for input_feature, pred_feature in zip(input_image_feature_list, pred_image_feature_list):
-                input_image_feature_l2_norm_list.append(self.safe_L2_norm(input_feature))
-                pred_image_feature_l2_norm_list.append(self.safe_L2_norm(pred_feature))
-            #计算输入和预测特征图的L2差别
-            diff_list = []
-            for input_feature, pred_feature in zip(input_image_feature_l2_norm_list, pred_image_feature_l2_norm_list):
-                diff = input_feature - pred_feature
-                diff_list.append(diff**2)
-            #根据不同层的权重，计算最终的感知损失
-            loss = 0.0
-            for i in range(self.L):
-                loss += torch.sum(self.channel_weights_list[i].view(1,-1,1,1) * diff_list[i], dim = 1, keepdim=True).mean(dim=(1,2,3))
-        elif self.model_name == "yolox":
-            yolox_input_image = self.vae_input_image_to_yolox_input_image(input_image)
-            yolox_pred_image = self.vae_input_image_to_yolox_input_image(pred_image)
-            input_image_feature_list = list(self.yolox_model(yolox_input_image).values())
-            pred_image_feature_list = list(self.yolox_model(yolox_pred_image).values())
-            #对所有特征在通道维度进行L2归一化
-            input_image_feature_l2_norm_list, pred_image_feature_l2_norm_list = [], []
-            for input_feature, pred_feature in zip(input_image_feature_list, pred_image_feature_list):
-                input_image_feature_l2_norm_list.append(self.safe_L2_norm(input_feature))
-                pred_image_feature_l2_norm_list.append(self.safe_L2_norm(pred_feature))
-            #计算输入和预测特征图的L2差别
-            diff_list = []
-            for input_feature, pred_feature in zip(input_image_feature_l2_norm_list, pred_image_feature_l2_norm_list):
-                diff = input_feature - pred_feature
-                diff_list.append(diff**2)
-            #这里直接使用不同通道的特征差异作为权重损失，去除尺寸对特征的影响，保留通道数量对特征的影响
-            # loss = torch.sum(torch.cat([diff.mean(dim=(2,3)) for diff in diff_list], dim=1), dim=1, keepdim=True)
-            loss = torch.sum(torch.cat([diff.mean(dim=(1,2,3), keepdim=True) for diff in diff_list], dim=1), dim=1, keepdim=True)
-        else:
-            raise ValueError("model_name must be vgg16 or yolox, but got {}".format(self.model_name))
-        return loss.mean()
 
 
 def computer_vae_loss(perception_model, input_image, rebuilt_image, mu, log_var, clamp=False):
@@ -1213,7 +912,7 @@ def multi_gpu_vae_train(args, save_ckpt = True, net=VAE):
         
     # === 3. 恢复参数及随机状态 ===
     if args.resume_train:
-        ckpt_path = args.ckpt_path
+        ckpt_path = args.vae_ckpt_path
         assert os.path.exists(ckpt_path), f"恢复训练指定的ckpt文件：{ckpt_path} 不存在" 
         resume_epoch, best_loss, resume_global_steps = load_checkpoint(ckpt_path, model, optimizer, scheduler, rank)  
         logging.info(f"恢复训练，ckpt路径为: {ckpt_path}")
@@ -1284,10 +983,58 @@ def multi_gpu_vae_train(args, save_ckpt = True, net=VAE):
     dist.destroy_process_group()
 
 
+def check_image_embeddings(args):
+    image_save_path = "./infer_img/image_embeddings_check_result.jpg"
+    image_embeddings_json = "./dataset/flickr30kr/flickr30k_annotations/image_embeddings_info_512_to_64.json"
+    image_npy_path = "./dataset/flickr30kr/flickr30k_annotations/image_embeddings_512_to_64.npy"
+    vae_model_path = "./checkpoint/vae_model/best_ckpt.pth"
+    with open(image_embeddings_json, 'r', encoding='utf-8') as f:
+        json_content = json.load(f)
+    try:
+        image_embeddings_shape = tuple(json_content["embedding_shape"])
+        image_embeddings_dtype = json_content["embedding_dtype"]
+    except:
+        raise ValueError(f'{image_embeddings_json}文件缺失embedding_shape和embedding_dtype两个字段，无法加载{image_npy_path}文件')
+    
+    if  image_embeddings_dtype not in ["float32", "float16"]:
+        raise ValueError(f'{image_embeddings_json}文件中数据类型与预期不匹配，只支持float32和float16，不支持{image_embeddings_dtype}，无法加载{image_npy_path}文件')
+
+    device = args.device
+    image_embeddings_dtype = np.float16 if image_embeddings_dtype == "float16" else np.float32
+    image_embeddings = np.memmap(image_npy_path, dtype=image_embeddings_dtype, mode='r', shape=image_embeddings_shape)
+    image_index = random.randint(0, len(image_embeddings)-1)
+    # image_index = 1
+    image_embedding = torch.tensor(image_embeddings[image_index], dtype=torch.float32).unsqueeze(0).to(device)
+
+    # vae_model = VAE(args)
+    # vae_encoder_model = ldm_load_model(vae_model_path, vae_model).encoder.to(device)
+    # vae_encoder_model.eval()
+    # print("image_embedding: ", image_embedding)
+    # image_path = "./dataset/flickr30kr/flickr30k_images_512/images/10002456.jpg"
+    # image_trans = get_image_transformer(512)
+    # input_image_embedding = image_trans(Image.open(image_path)).unsqueeze(0).to(device)
+    # with torch.no_grad():
+    #     input_image_embedding = vae_encoder_model(input_image_embedding)
+    # mu = input_image_embedding[:, :4]
+    # print("mu: ", mu)
+
+    vae_model = VAE(args)
+    vae_decoder_model = ldm_load_model(vae_model_path, vae_model).decoder.to(device)
+    vae_decoder_model.eval()
+    with torch.no_grad():
+        pred_x = vae_decoder_model(image_embedding)
+
+    #保存最终图片
+    image = detransform_tensor2image(pred_x.detach().cpu())
+    concatenated_image = concatenate_images_horizontally(image)
+    concatenated_image.save(image_save_path)
+
+
+
 def vae_inference(args, net=VAE):
     #支持同时推理多张图片
     device = get_device(args.device)
-    model_path = args.ckpt_path
+    model_path = args.vae_ckpt_path
     vae_infer_image_path = args.vae_infer_image_path
     image_transformers = get_image_transformer(args.input_image_size)
     if os.path.isfile(vae_infer_image_path):
@@ -1296,7 +1043,8 @@ def vae_inference(args, net=VAE):
     else:
         raise ValueError(f"输入的图片路径不是一个文件：{vae_infer_image_path}")
 
-    model = ddpm_load_model(model_path, net).to(device)
+    model = net(args)
+    model = ldm_load_model(model_path, model).to(device)
     model.eval()
     
     infer_times = int(args.infer_times)
@@ -1329,10 +1077,11 @@ if __name__ == '__main__':
     argparse.add_argument('--base_fold', type=str, default='./project')
     argparse.add_argument("--device", type=str, default="cuda:3")
     argparse.add_argument("--train_image_fold", type=str, default="./dataset/flickr30kr/flickr30k_images_512/images")
-    argparse.add_argument("--ddpm_dataset_fold", type=str, default="./dataset/flickr30kr/flickr30k_images_512_test")
+    argparse.add_argument("--ddpm_dataset_fold", type=str, default="./dataset/flickr30kr/flickr30k_images_128")
     argparse.add_argument("--total_steps", type=int, default=1000)
     argparse.add_argument("--mode", type=str, default="multi_gpu_vae_train")
-    argparse.add_argument("--ckpt_path", type=str, default="/shared_file/hand_write_aigc/project/20250711_231553_966794/checkpoints/least_epoch_ckpt.pth")
+    argparse.add_argument("--vae_ckpt_path", type=str, default="")
+    argparse.add_argument("--unet_ckpt_path", type=str, default="")
     argparse.add_argument("--infer_times", type=int, default=10)
     argparse.add_argument("--denoise_steps_gap", type=int, default=50)
     argparse.add_argument("--inference_image_save_fold", type=str, default="./infer_img")
@@ -1374,6 +1123,8 @@ if __name__ == '__main__':
             multi_gpu_vae_train(args, save_ckpt=save_ckpt)
     elif args.mode == "ddpm_infer":
         ddpm1_inference(args)  #ddpm推理
+    elif args.mode == "ldm_infer":
+        ldm_inference(args)  #ddpm推理
     elif args.mode == "vae_infer":
         vae_inference(args)  #vae推理
     elif args.mode == "show_add_noise_process":
@@ -1382,8 +1133,8 @@ if __name__ == '__main__':
         show_demoise_image()  #可视化去噪过程，验证去噪公式是否有效
     elif args.mode == "test":
         test()
-    elif args.mode == "count_params":
-        count_params(args)
     elif args.mode == "computrt_fid":
         test_computer_fid_loss(args)
-
+    elif args.mode == "check_vae_encoder_result":
+        check_image_embeddings(args)
+        
