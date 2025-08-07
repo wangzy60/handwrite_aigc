@@ -20,12 +20,10 @@ import math
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from model.unet import Unet_With_Text_Condition as Unet
-# from model.unet import Unet_Without_Condition as Unet
 # from model.unet import Unet2 as Unet
 from model.vae import KL_VAE as VAE
 from model.my_lpips_loss import LPIPS 
-from model.dataset import DDPM_Flickr30K_CLIP_Dataset, LDM_Flickr30K_CLIP_Dataset
+from model.dataset import VAE_Dataset
 from utils.ddpm_schedule import add_noise
 from utils.utils import clip_vit_base_patch32_model_infer
 from utils.utils import get_device, get_image_transformer, detransform_tensor2image, ldm_load_model
@@ -40,7 +38,23 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision.models import inception_v3
 import lpips
 from scipy.linalg import sqrtm
+import sys
 
+
+# 针对旧版NumPy的兼容性补丁
+if np.__version__ < "1.26.0":
+    class DummyCoreModule:
+        __path__ = []  # 使模块表现为包
+        __all__ = []   # 避免导入错误
+    
+    # 创建虚拟模块链
+    sys.modules["numpy._core"] = DummyCoreModule()
+    sys.modules["numpy._core._multiarray_umath"] = DummyCoreModule()
+    
+    # 将实际功能重定向到旧版位置
+    import numpy.core as actual_core
+    sys.modules["numpy._core"] = actual_core
+    sys.modules["numpy._core._multiarray_umath"] = actual_core._multiarray_umath
 
 #绘制最近一个epoch的损失曲线:done
 #学习率调度:done
@@ -49,6 +63,29 @@ from scipy.linalg import sqrtm
 #FID损失计算
 #DDIM采样实现
 #IS损失计算        
+
+
+def get_unet(args):
+    if args.input_image_dims == 4 and args.output_image_dims == 4:
+        from model.unet import Unet_With_Text_Condition as Unet
+    elif args.input_image_dims == 3 and args.output_image_dims == 3:
+        from model.unet import Unet_Without_Condition as Unet
+        # from model.unet import Unet3 as Unet
+    else:
+        raise ValueError(f"获得Unet模型失败，args.input_image_dims: {args.input_image_dims}和args.output_image_dims: {args.output_image_dims} 必须相等，且只能为3或4")
+    logging.info(f"使用的模型为{Unet}")
+    return Unet
+
+def get_ddpm_dataset(args):
+    if args.input_image_dims == 4 and args.output_image_dims == 4:
+        from model.dataset import LDM_Flickr30K_CLIP_Dataset as DDPM_Dataset
+    elif args.input_image_dims == 3 and args.output_image_dims == 3:
+        from model.dataset import DDPM_Flickr30K_Dataset as DDPM_Dataset
+    else:
+        raise ValueError(f"获得DDPM数据集类型失败，args.input_image_dims: {args.input_image_dims}和args.output_image_dims: {args.output_image_dims} 必须相等，且只能为3或4")
+    logging.info(f"使用的模型为{DDPM_Dataset}")
+    return DDPM_Dataset
+
 
 def print_on_rank0(anything):
     rank = int(os.environ["RANK"])
@@ -138,87 +175,6 @@ class DDPM1_Dataset(torch.utils.data.Dataset):
         return img_with_noisy, t, noise
 
 
-class DDPM_Flickr30K_Dataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):
-        super().__init__()
-        self.dataset_fold = dataset_fold
-        #图像相关
-        self.image_paths = glob(os.path.join(self.dataset_fold, "*.jpg"))
-        self.transform = transform
-        self.total_steps = total_steps
-        self.shift_func = shift_func
-        self.noise_func = noise_func
-
-        logging.info(f'数据集加载了目录{self.dataset_fold}下的{len(self.image_paths)}张图像')
-        logging.info(f'前20张图像地址为：{self.image_paths[:20] if len(self.image_paths) > 20 else self.image_paths}')
-
-    def __len__(self):
-        return len(self.image_paths)
-    
-    def add_noise(self, x, t, verbose=False):
-        return add_noise(x, t, self.shift_func, self.noise_func, verbose=verbose)
-
-    def __getitem__(self, index):
-        image_path = self.image_paths[index]
-        image = Image.open(image_path)
-        if self.transform is not None:
-            image = self.transform(image)
-        t = torch.randint(0, self.total_steps, (1,))  #torch.randint不包含最后一个数
-        img_with_noisy, _, noise = self.add_noise(image, t)
-        return img_with_noisy, t, noise
-
-
-class DDPM_CelebAHQ_Dataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):
-        super().__init__()
-        #图像相关
-        self.image_dir = dataset_fold
-        self.image_paths = glob(os.path.join(self.image_dir, '*.jpg'))
-        self.transform = transform
-        self.total_steps = total_steps
-        self.shift_func = shift_func
-        self.noise_func = noise_func
-
-        logging.info(f'数据集加载了目录{self.dataset_fold}下的{len(self.image_paths)}张图像')
-        logging.info(f'前20张图像地址为：{self.image_paths[:20] if len(self.image_paths) > 20 else self.image_paths}')
-
-        
-    def __len__(self):
-        return len(self.image_paths)
-    
-    def add_noise(self, x, t, verbose=False):
-        return add_noise(x, t, self.shift_func, self.noise_func, verbose=verbose)
-
-    def __getitem__(self, index):
-        image_path = self.image_paths[index]
-        image = Image.open(image_path)
-        if self.transform is not None:
-            image = self.transform(image)
-        t = torch.randint(0, self.total_steps, (1,))  #这里需要用total_steps+1，因为torch.randint不包含最后一个数
-        img_with_noisy, _, noise = self.add_noise(image, t)
-        return img_with_noisy, t, noise
-
-
-
-class VAE_Dataset(torch.utils.data.Dataset):
-    def __init__(self, image_dir, transform = None):
-        super().__init__()
-        self.image_paths = (glob(os.path.join(image_dir, '*.jpg')) + glob(os.path.join(image_dir, '*.jpeg')))
-        logging.info(f'VAE数据集加载了{len(self.image_paths)}张图像')
-        logging.info(f'前20张图像地址为：\n{self.image_paths[:20] if len(self.image_paths) > 20 else self.image_paths}')
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, index):
-        image_path = self.image_paths[index]
-        image = Image.open(image_path)
-        if self.transform is not None:
-            image = self.transform(image)
-        return image
-
-
 def show_image_with_noise(image_path, max_t, iter_gap, shift_func, noise_func, save_image= True, verbose = False, image_save_path = None, noise_save_path = None):
     img_with_noisy_list = []
     noise_img_list = []
@@ -282,7 +238,7 @@ def plot_training_loss(save_path, losses):
     plt.close()
 
 
-def ddpm1_train(args, net=Unet):
+def ddpm1_train(args):
     ckpt_save_fold = os.path.join(args.project_path, args.ckpt_save_fold)
     loss_img_save_path = os.path.join(args.project_path, 'loss_img.png')
     train_mse_loss_mode = args.train_mse_loss_mode
@@ -291,6 +247,7 @@ def ddpm1_train(args, net=Unet):
     device = get_device(args.device)
     train_image_fold = args.train_image_fold
     total_steps = args.total_steps
+    net = get_unet(args)
     model = net(args).to(device)
     logging.info(model)
     image_transformer = get_image_transformer(args.input_image_size)
@@ -373,18 +330,77 @@ def concatenate_images_vertical(image_numpy_list):
     return new_image
 
 
-
-def ddpm1_inference(args, net=Unet):
+def ddpm_validation(model, args, epoch_index):
     #支持同时推理多张图片
-    device = get_device(args.device)
-    total_steps = int(args.total_steps)
-    model_path = args.unet_ckpt_path
-
-    model = net(args)
-    model = ldm_load_model(model_path, model).to(device)
+    device = next(model.parameters()).device
     model.eval()
-    
-    infer_times = int(args.infer_times)
+    total_steps = int(args.total_steps)
+    batch_size = 10
+    ddpm_prompt_list = args.ddpm_prompt_list
+    denoise_steps_gap = 1
+    inference_image_save_fold = args.project_path
+    with torch.no_grad():
+        logging.info(f"第{epoch_index}轮训练开始推理...")
+        x_t = torch.randn(batch_size, 3, args.input_image_size, args.input_image_size).to(device)
+        if ddpm_prompt_list:
+            embeddings = clip_vit_base_patch32_model_infer(ddpm_prompt_list, device)
+        image_name = f"train_{epoch_index}_epochs_infer.jpg"
+        image_save_path = os.path.join(inference_image_save_fold, image_name)
+        time_schedule = list(range(total_steps-1, -1, -1 * denoise_steps_gap))
+
+        #ddpm
+        for t in tqdm(time_schedule):
+            time_step = torch.tensor([t]*batch_size).to(device)
+            if ddpm_prompt_list:
+                predict_noise = model(x_t, time_step, embeddings)
+            else:
+                predict_noise = model(x_t, time_step)
+            a_t = alpha_t_list[t]
+            b_t = beta_t_list[t]
+            b_t_bar = beta_t_bar_list[t]
+            b_t_minus_one_bar = beta_t_bar_list[t-1] if t - 1 >= 0 else 0
+            sigma = b_t * b_t_minus_one_bar  / b_t_bar
+            # sigma = b_t
+            x_t = 1 / a_t * (x_t - b_t**2 / b_t_bar * predict_noise) + sigma * torch.randn_like(x_t)
+  
+        
+        # ##ddim
+        # if time_schedule[-1] != 0:
+        #     time_schedule.append(0)
+        # for i in tqdm(range(len(time_schedule))):
+        #     t = time_schedule[i]
+        #     time_step = torch.tensor([t]*batch_size).to(device)
+        #     # predict_noise = model(x_t, time_step, embeddings)
+        #     predict_noise = model(x_t, time_step)
+        #     p_t = time_schedule[i+1] if i+1 < len(time_schedule) else None
+        #     a_t = float(alpha_t_bar_list[t])
+        #     a_pt = float(alpha_t_bar_list[p_t] if i+1 < len(time_schedule) else 1)
+        #     b_t = float(beta_t_bar_list[t])
+        #     b_pt = float(beta_t_bar_list[p_t] if i+1 < len(time_schedule) else 0)
+        #     sigma = torch.sqrt(torch.tensor(1.0) - (a_t**2)/(a_pt**2)) * b_pt  / b_t
+        #     x_t = (a_pt / a_t) * (x_t + (a_t*torch.sqrt(b_pt**2 - sigma**2)/a_pt - b_t) * predict_noise) + torch.randn_like(x_t) * sigma
+
+        #     #保存过程图片
+        #     if (inference_show_denoise_image_every_n_steps is not None) and (t < image_save_taggle):
+        #         image_save_taggle -= inference_show_denoise_image_every_n_steps
+        #         image_list.append(detransform_tensor2image(x_t.detach().cpu()))        
+
+        #保存最终图片
+        image = detransform_tensor2image(x_t.detach().cpu())
+        concatenated_image = concatenate_images_horizontally(image)
+        concatenated_image.save(image_save_path)
+    del x_t, time_step
+    if ddpm_prompt_list:
+        del embeddings
+    logging.info(f"第{epoch_index}轮训练推理成功，图片保存至{image_save_path}")
+    model.train()
+
+
+def ddpm_inference(model, args):
+    #支持同时推理多张图片
+    device = next(model.parameters()).device
+    total_steps = int(args.total_steps)
+    model.eval()
     batch_size = int(args.batch_size)
     ddpm_prompt_list = args.ddpm_prompt_list
     denoise_steps_gap = int(args.denoise_steps_gap)
@@ -457,8 +473,9 @@ def ddpm1_inference(args, net=Unet):
 
 
 
-def ldm_inference(args, unet=Unet, vae = VAE):
+def ldm_inference(args, vae = VAE):
     #支持同时推理多张图片
+    unet = get_unet(args)
     device = get_device(args.device)
     total_steps = int(args.total_steps)
     unet_model_path = args.unet_ckpt_path
@@ -528,7 +545,7 @@ def ldm_inference(args, unet=Unet, vae = VAE):
         #         image_list.append(detransform_tensor2image(x_t.detach().cpu()))        
 
         # vae decoder
-        mu = x_t * 0.8696986216297429  # 0.8696986216297429是flickr30K图片经过训练好的vae encoder之后输出的标准差，在训练ddpm时，对每个输入数据除以了这个数
+        mu = x_t * 6.506264453510935  # 6.506264453510935是flickr30K图片经过训练好的vae encoder之后输出的标准差，在训练ddpm时，对每个输入数据除以了这个数
         std = 1
         # latent_z = mu + std * torch.randn_like(mu)
         latent_z = mu
@@ -678,7 +695,7 @@ def load_checkpoint(ckpt_path, model, optimizer, scheduler, rank):
     return epoch, best_loss, global_steps
         
 
-def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
+def multi_gpu_ddpm_train(args, save_ckpt = True):
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -701,33 +718,23 @@ def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
         epoch_lr_list = []
 
     # === 3. 准备数据 ===
-    train_image_fold = args.train_image_fold
     total_steps = args.total_steps
     ddpm_dataset_fold = args.ddpm_dataset_fold
     image_transformer = get_image_transformer(args.input_image_size)
+    DDPM_Dataset = get_ddpm_dataset(args)
+    ddpm_dataset = DDPM_Dataset(ddpm_dataset_fold,
+                                 alpha_t_bar_list,
+                                 beta_t_bar_list,
+                                 total_steps = total_steps,
+                                 transform = image_transformer)
 
-    ddpm_dataset = LDM_Flickr30K_CLIP_Dataset(ddpm_dataset_fold, 
-                                                alpha_t_bar_list, 
-                                                beta_t_bar_list, 
-                                                total_steps=total_steps, 
-                                                transform=image_transformer)
-
-    # ddpm_dataset = DDPM_Flickr30K_CLIP_Dataset(ddpm_dataset_fold, 
-    #                                         alpha_t_bar_list, 
-    #                                         beta_t_bar_list, 
-    #                                         total_steps=total_steps, 
-    #                                         transform=image_transformer)
-    # ddpm_dataset = DDPM_Flickr30K_Dataset(ddpm_dataset_fold, 
-    #                                     alpha_t_bar_list, 
-    #                                     beta_t_bar_list, 
-    #                                     total_steps=total_steps, 
-    #                                     transform=image_transformer)
     sampler = DistributedSampler(
         ddpm_dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=True
     )
+
     dataloader = torch.utils.data.DataLoader(
         ddpm_dataset,
         batch_size=args.batch_size,
@@ -738,6 +745,7 @@ def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
     total_batchs = len(dataloader)
 
     # === 3. 创建模型 ===
+    net = get_unet(args)
     model = net(args).to(local_rank)
     model = DDP(model, device_ids=[local_rank])  # DDP 包装
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr * world_size, betas=(0.9, 0.999), eps=1e-8, weight_decay=0)
@@ -824,6 +832,14 @@ def multi_gpu_ddpm_train(args, save_ckpt = True, net=Unet):
             ((epoch == args.epochs -1) and args.resume_train and (global_steps-1 > resume_global_steps) and (rank==0)):
             last_epoch_ckpt_save_path = os.path.join(ckpt_save_fold, f"last_epoch_ckpt.pth")
             save_checkpoint(epoch, batch_index,global_steps-1,best_loss,model,optimizer,scheduler,last_epoch_ckpt_save_path)
+        
+        #每n个epoch进行一次推理验证，推理结果图片放在project下
+        if ((not args.resume_train) or \
+            (args.resume_train and (global_steps-1 > resume_global_steps))) and (epoch % 25 == 0):
+            if rank == 0:
+                ddpm_validation(model, args, epoch)
+            torch.cuda.empty_cache()
+
     # === 5. 清理 ===
     dist.destroy_process_group()
 
@@ -1122,7 +1138,13 @@ if __name__ == '__main__':
         elif args.mode == "multi_gpu_vae_train":
             multi_gpu_vae_train(args, save_ckpt=save_ckpt)
     elif args.mode == "ddpm_infer":
-        ddpm1_inference(args)  #ddpm推理
+        net = get_unet(args)
+        model_path = args.unet_ckpt_path
+        model = net(args)
+        model = ldm_load_model(model_path, model)
+        device = get_device(args.device)
+        model = model.to(device)
+        ddpm_inference(model, args)  #ddpm推理
     elif args.mode == "ldm_infer":
         ldm_inference(args)  #ddpm推理
     elif args.mode == "vae_infer":

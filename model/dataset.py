@@ -11,128 +11,38 @@ from utils.utils import clip_vit_base_patch32_model_infer
 from utils.ddpm_schedule import add_noise
 
 
-class DDPM_Flickr30K_CLIP_Dataset(torch.utils.data.Dataset):
+class VAE_Dataset(torch.utils.data.Dataset):
+    def __init__(self, image_dir, transform = None):
+        super().__init__()
+        self.image_paths = (glob(os.path.join(image_dir, '*.jpg')) + glob(os.path.join(image_dir, '*.jpeg')))
+        logging.info(f'VAE数据集加载了{len(self.image_paths)}张图像')
+        logging.info(f'前20张图像地址为：\n{self.image_paths[:20] if len(self.image_paths) > 20 else self.image_paths}')
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        image_path = self.image_paths[index]
+        image = Image.open(image_path)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image
+
+
+class DDPM_Flickr30K_Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):
         super().__init__()
         self.dataset_fold = dataset_fold
-        self.every_image_n_annotations = 5
-        self.max_token_num = 77
-        self.embeddings_dim = 512
-        self.embeddings_drop_ratio = 0.1
-
-        #标注相关
-        self.train_images = glob(os.path.join(self.dataset_fold, '*.json'))
-        assert len(self.train_images) == 1, f'{self.dataset_fold}下有多个json文件或缺失json文件'
-        self.train_images = self.train_images[0]  #1、标注embedding数据的形状、数据类型信息，2、图像名称和索引对于关系
-
-        self.anno_csv_path = "./dataset/flickr30kr/flickr30k_annotations/text_annotations.csv"  #标注信息原始数据
-        self.anno_npz_path = "./dataset/flickr30kr/flickr30k_annotations/text_embeddings.npz"  #标注信息转换成的embedding数据，np.memmap格式
-        
         #图像相关
-        self.image_dir = os.path.join(dataset_fold, "images")
-        self.image_paths = []
+        self.image_paths = glob(os.path.join(self.dataset_fold, "*.jpg"))
         self.transform = transform
         self.total_steps = total_steps
         self.shift_func = shift_func
         self.noise_func = noise_func
 
-        logging.info("-----开始加载并检查标注embeddings数据-----")
-        self.load_annotation()
-        self.load_image_paths()
-        self.check_annotation()
-        self.empty_text_embeddings = self.get_empty_text_embeddings()
-        logging.info("-----数据加载完毕，所有检查通过-----")
-
-
-    def load_annotation(self):
-        with open(self.train_images, 'r', encoding='utf-8') as f:
-            json_content = json.load(f)
-            if "memmap_info" in json_content and "image_index_to_name" in json_content:
-                embedding_info = json_content["memmap_info"]
-                image_index_to_name = json_content["image_index_to_name"]
-            else:
-                raise ValueError(f'{self.train_images}文件中memmap_info字段或image_index_to_name字段缺失，无法加载{self.anno_npz_path}文件')
-        
-        if embedding_info and ("embedding_shape" in embedding_info) and ("embedding_dtype" in embedding_info):
-            self.embeddings_shape = tuple(embedding_info["embedding_shape"])
-            self.embeddings_dtype = embedding_info["embedding_dtype"]
-        else:
-            raise ValueError(f'{self.train_images}文件中memmap_info字段缺失embedding_shape和embedding_dtype两个字段，无法加载{self.anno_npz_path}文件')
-        
-        if self.embeddings_shape[1:] != (self.every_image_n_annotations, self.max_token_num, self.embeddings_dim) or self.embeddings_dtype not in ["float32", "float16"]:
-            raise ValueError('f{self.train_images}文件中memmap_info字段下的形状或数据类型与预期不匹配，无法加载{self.anno_npz_path}文件')
-        
-        self.embeddings_dtype = np.float16 if self.embeddings_dtype == "float16" else np.float32
-        self.embeddings = np.memmap(self.anno_npz_path, dtype=self.embeddings_dtype, mode='r', shape=self.embeddings_shape)
-
-        self.image_index_to_name = image_index_to_name
-        logging.info("标注embeddings数据加载完成")
-
-
-    def load_image_paths(self):
-        logging.info("开始检查标注文件中图片是否都存在")
-        img_name_list = list(self.image_index_to_name.values())
-        # for img_name in tqdm(img_name_list):
-        #     img_path = os.path.join(self.image_dir, img_name)
-        #     if not os.path.isfile(img_path):
-        #         self.image_paths = []
-        #         raise ValueError(f"图片{img_path}不存在，请检查")
-        #     else:
-        #         self.image_paths.append(img_path)
-        logging.info("图片名字和索引对照表检查通过")
-
         logging.info(f'数据集加载了目录{self.dataset_fold}下的{len(self.image_paths)}张图像')
         logging.info(f'前20张图像地址为：{self.image_paths[:20] if len(self.image_paths) > 20 else self.image_paths}')
-
-
-    def random_check_embeddings(self, input_words_list, input_embedding):
-        clip_result = clip_vit_base_patch32_model_infer(input_words_list, device='cpu')
-        clip_result = clip_result.squeeze().numpy().astype(self.embeddings_dtype)
-        input_embedding = input_embedding.squeeze()
-        logging.info(f"随机选取的标注内容：{input_words_list}")
-        logging.info(f"实际结果：{clip_result}")
-        logging.info(f"读取内容：{input_embedding}")
-        if np.any(abs(clip_result-input_embedding) > 1e-2):
-            return False
-        else:
-            return True
-    
-    def get_empty_text_embeddings(self):
-        input_words_list = [""]
-        logging.info(f"开始使用{input_words_list}获取空文本embeddings")
-        clip_result = clip_vit_base_patch32_model_infer(input_words_list, device='cpu')
-        clip_result = clip_result.squeeze().numpy()
-        if clip_result.shape != (self.max_token_num, self.embeddings_dim):
-            raise ValueError(f"获取空文本embeddings失败，返回的embedding维度为{clip_result.shape}，不是{self.max_token_num, self.embeddings_dim}")
-        else:
-            logging.info(f"获取空文本embeddings成功，返回的空文本embedding的值为{clip_result}")
-        return clip_result
-
-
-    def check_annotation(self):
-        #随机选取一个标注，检查其内容是否和clip的原始输出内容一致
-        logging.info("开始检查随机选取的一个标注是否和clip的原始输出内容一致")
-        random_image_index = random.randint(0, len(self.image_index_to_name.keys())-1)
-        random_anno_index = random.randint(0,self.every_image_n_annotations-1)
-        random_image_name = self.image_index_to_name[str(random_image_index)]
-        annotation = None
-        with open(self.anno_csv_path, 'r', encoding='utf-8') as f:
-            csv_content = f.readlines()
-            for i in range(len(csv_content)):
-                if csv_content[i].startswith(random_image_name):
-                    annotation = csv_content[i + random_anno_index]
-                    annotation = annotation.split("|")[-1].replace("\n", " ").strip()
-                    break
-        if annotation is None:
-            raise ValueError("没有找到随机的图片及其对应的标注, 请检查代码")
-
-        input_embedding = self.embeddings[random_image_index][random_anno_index]
-        input_words_list = [annotation]
-
-        if self.random_check_embeddings(input_words_list, input_embedding):
-            logging.info(f"随机选取的图片为：{random_image_name}，随机选取的标注为:{annotation}，和clip的原始输出内容一致")
-        else:
-            raise ValueError("数据检查失败")        
 
     def __len__(self):
         return len(self.image_paths)
@@ -147,14 +57,8 @@ class DDPM_Flickr30K_CLIP_Dataset(torch.utils.data.Dataset):
             image = self.transform(image)
         t = torch.randint(0, self.total_steps, (1,))  #torch.randint不包含最后一个数
         img_with_noisy, _, noise = self.add_noise(image, t)
-        if random.random() > self.embeddings_drop_ratio:
-            picture_annotation_embedding = self.embeddings[index][random.randint(0, self.every_image_n_annotations-1)]
-        else:
-            picture_annotation_embedding = self.empty_text_embeddings
-        picture_annotation_embedding = torch.tensor(picture_annotation_embedding, dtype=torch.float)
-        return img_with_noisy, t, noise, picture_annotation_embedding
-    
-    
+        return img_with_noisy, t, noise
+
 
 class LDM_Flickr30K_CLIP_Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_fold, shift_func, noise_func, total_steps = 1000, transform = None):

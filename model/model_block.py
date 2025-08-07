@@ -1,10 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+import logging
+
+
+def is_all_zeros(tensor, tol=1e-6):
+    """检查张量是否全零（考虑浮点误差）"""
+    return torch.all(torch.abs(tensor) < tol).item()
 
 def init_ddpm_params(model):
     if isinstance(model, (nn.Conv2d, nn.Linear)):
-        nn.init.kaiming_normal_(model.weight, mode='fan_in', nonlinearity="relu")
+        if is_all_zeros(model.weight):
+            logging.info(f"跳过全零初始化层: {model}")
+        else:
+            nn.init.kaiming_normal_(model.weight, mode='fan_in', nonlinearity="relu")
         if model.bias is not None:
             nn.init.zeros_(model.bias)
     elif isinstance(model, nn.Embedding):
@@ -297,7 +307,38 @@ class residual_block(nn.Module):
 
     def forward(self, x):
         return self.conv(x) + self.resdital(x)
-    
+
+
+def set_module_zero(module):
+    for param in module.parameters():
+        param.detach().zero_()
+    return module
+
+class residual_block_with_time_embedding(nn.Module):
+    def __init__(self, input_dim, out_dim, time_embedding_dim, activate_func_name):
+        super().__init__()
+        self.activate_func_name = activate_func_name
+        self.conv1 = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=input_dim),
+                                   get_activate_func(activate_func_name),
+                                   nn.Conv2d(input_dim, out_dim, kernel_size=3, stride=1, padding=1))
+        self.time = nn.Sequential(nn.Linear(time_embedding_dim, out_dim), 
+                                  get_activate_func(activate_func_name))
+        self.conv2 = nn.Sequential(nn.GroupNorm(num_groups=32, num_channels=out_dim),
+                                   get_activate_func(activate_func_name),
+                                   set_module_zero(nn.Conv2d(out_dim, out_dim, kernel_size=3, stride=1, padding=1)))
+        self.resdital = nn.Identity() if input_dim == out_dim \
+                                      else nn.Conv2d(input_dim, out_dim, kernel_size=1, stride=1)
+
+    def forward(self, x, time_embedding):
+        input_x = x
+        x = self.conv1(x)
+        time = self.time(time_embedding).squeeze()
+        while len(time.shape) < len(x.shape):
+            time = time[..., None]
+        x = x + time
+        x = self.conv2(x)
+        return self.resdital(input_x) + x
+
 
 class residual_block_acti_func_forward(nn.Module):
     def __init__(self, input_dim, out_dim, image_size, activate_func_name):
@@ -389,6 +430,54 @@ class multihead_attation_block(nn.Module):
         return x
 
 
+class image_slef_attation_block(nn.Module):
+    def __init__(self,in_dim, activate_func_name, heads = 8):
+        #仅支持使用图像作为注意力的输入
+        super().__init__()
+        self.heads = heads
+        self.in_dim = in_dim
+        assert in_dim % heads == 0, f"multi head latent dim must be divisible by heads number, but got latent dim: {in_dim} and heads: {heads}"
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_dim)
+        self.qkv_proj = nn.Linear(in_dim, 3*in_dim)
+        self.latent_to_out = nn.Sequential(nn.Linear(in_dim, in_dim),
+                                           get_activate_func(activate_func_name))
+                                           
+    def _forward(self, x):
+        # q/k/v: (batch, channel, height*width) or (batch, channel, height, width)
+        # permute后显示使用contiguous避免内存不连续问题
+        input_x = x
+        heads = self.heads
+        latent_dim = self.in_dim
+        x = self.norm(x)
+        image_shape = x.shape
+        x = x.flatten(start_dim=2).permute(0, 2, 1).contiguous() # b, c, h, w -> b, h*w, c
+        x = self.qkv_proj(x)
+        q,k,v = x.chunk(3, dim=-1)
+        batch_size, seq, _ = q.shape
+        q = q.reshape(batch_size, seq, heads, latent_dim//heads).permute(0, 2, 1, 3).contiguous() # b, h*w, c -> b, h*w, head, c//head -> b, head, h*w, c//head
+        k = k.reshape(batch_size, seq, heads, latent_dim//heads).permute(0, 2, 1, 3).contiguous()
+        v = v.reshape(batch_size, seq, heads, latent_dim//heads).permute(0, 2, 1, 3).contiguous()
+        
+        #使用torch的注意力计算减少显存占用，默认会除以根号d，不用手动设置
+        x = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask = None,
+            dropout_p = 0.0,
+            is_causal = False)
+        
+        #自己实现注意力计算
+        # attation_score = torch.matmul(q, k.permute(0, 1, 3, 2)) / torch.sqrt(torch.tensor(latent_dim//heads)) # b, head, h*w, h*w
+        # attation_score = F.softmax(attation_score, dim = -1) # b, head, h*w, h*w
+        # x = torch.matmul(attation_score, v) # b, head, h*w, h*w @ b, head, h*w, c//head -> b, head, h*w, c//head
+        
+        x = x.permute(0, 2, 1, 3).contiguous().reshape(batch_size, seq, -1) # b, head, h*w, c//head -> b, h*w, head, c//head -> b, h*w, c
+        x = self.latent_to_out(x).permute(0,2,1).contiguous().reshape(*image_shape) #b, h*w, c -> b, c, h*w -> b, c, h, w
+        return input_x + x  
+    
+    def forward(self, x):
+        return checkpoint(self._forward, x, use_reentrant=False)
+
+
 class image_multihead_attation_block(nn.Module):
     def __init__(self,q_in_dim, k_in_dim, v_in_dim, latent_dim, out_dim, heads = 8):
         #仅支持使用图像作为注意力的输入
@@ -433,7 +522,7 @@ class image_multihead_attation_block(nn.Module):
         x = torch.matmul(attation_score, v) # b, head, h*w, h*w @ b, head, h*w, c//head -> b, head, h*w, c//head
         x = x.permute(0, 2, 1, 3).reshape(batch_size, seq, -1) # b, head, h*w, c//head -> b, h*w, head, c//head -> b, h*w, c
         x = self.latent_to_out(x).permute(0,2,1).reshape(*v_shape) #b, h*w, c -> b, c, h*w -> b, c, h, w
-        return x
+        return x  #这里忘记与输入进行残差连接了，加上残差连接效果可能更好
 
 
 class image_text_multihead_cross_attation_block(nn.Module):
@@ -479,3 +568,38 @@ class image_text_multihead_cross_attation_block(nn.Module):
 
 
 
+
+class Unet3_res_blocks(nn.Module):
+    def __init__(self, c_in, c_out, time_dims, activate_func_name, input_img_h, downsample = False, upsample = False, use_attation = False):
+        super().__init__()
+        self.downsample = downsample
+        self.upsample = upsample
+        self.use_attation = use_attation
+        assert not (self.downsample and self.upsample), "不能同时进行下采样和上采样"
+        self.res1 = residual_block_with_time_embedding(c_in, c_out, time_dims, activate_func_name)
+        self.res2 = residual_block_with_time_embedding(c_out, c_out, time_dims, activate_func_name)
+        if use_attation:
+            self.self_attation = image_slef_attation_block(c_out, activate_func_name)
+        self.res3 = residual_block_with_time_embedding(c_out, c_out, time_dims, activate_func_name)
+        if self.downsample:
+            self.updown = conv_downsampling(c_out, activate_func_name)  #如果是下采样，下采样放在模块的最后，所以channel是c_out
+        elif self.upsample:
+            self.updown = bilinear_upsampling_block(c_in//2, activate_func_name)  #如果是上采样，上采样放在模块的最前，所以channel是c_in
+        else:
+            self.updown = None
+
+    def forward(self, x, time_embedding, res=None):
+        if self.upsample:
+            assert res is not None, "Unet上采样过程中，未与下采样的输出进行连接，请检查"
+            x = self.updown(x)
+            x = torch.concat((x, res), dim=1)
+        x = self.res1(x, time_embedding)
+        x = self.res2(x, time_embedding)
+        if self.use_attation:
+            x = self.self_attation(x)
+        res = self.res3(x, time_embedding)
+        if self.downsample:
+            x = self.updown(res)
+        else:
+            x = res
+        return x, res
