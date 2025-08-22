@@ -69,8 +69,8 @@ def get_unet(args):
     if args.input_image_dims == 4 and args.output_image_dims == 4:
         from model.unet import Unet_With_Text_Condition as Unet
     elif args.input_image_dims == 3 and args.output_image_dims == 3:
-        from model.unet import Unet_Without_Condition as Unet
-        # from model.unet import Unet3 as Unet
+        # from model.unet import Unet_Without_Condition as Unet
+        from model.unet import Unet3 as Unet
     else:
         raise ValueError(f"获得Unet模型失败，args.input_image_dims: {args.input_image_dims}和args.output_image_dims: {args.output_image_dims} 必须相等，且只能为3或4")
     logging.info(f"使用的模型为{Unet}")
@@ -446,17 +446,17 @@ def ddpm_inference(model, args):
         #     # predict_noise = model(x_t, time_step, embeddings)
         #     predict_noise = model(x_t, time_step)
         #     p_t = time_schedule[i+1] if i+1 < len(time_schedule) else None
-        #     a_t = float(alpha_t_bar_list[t])
-        #     a_pt = float(alpha_t_bar_list[p_t] if i+1 < len(time_schedule) else 1)
-        #     b_t = float(beta_t_bar_list[t])
-        #     b_pt = float(beta_t_bar_list[p_t] if i+1 < len(time_schedule) else 0)
-        #     sigma = torch.sqrt(torch.tensor(1.0) - (a_t**2)/(a_pt**2)) * b_pt  / b_t
-        #     x_t = (a_pt / a_t) * (x_t + (a_t*torch.sqrt(b_pt**2 - sigma**2)/a_pt - b_t) * predict_noise) + torch.randn_like(x_t) * sigma
+        #     a_t = float(alpha_t_list[t])
+        #     b_t = float(beta_t_list[t])
+        #     b_t_bar = float(beta_t_bar_list[t])
+        #     b_pt_bar = float(beta_t_bar_list[p_t] if i+1 < len(time_schedule) else 0)
+        #     sigma = b_t * b_pt_bar / b_t_bar
+        #     x_t = (x_t - (b_t_bar - a_t * ((b_pt_bar**2 - sigma**2) ** 0.5)) * predict_noise) / a_t + torch.randn_like(x_t) * sigma
 
-        #     #保存过程图片
-        #     if (inference_show_denoise_image_every_n_steps is not None) and (t < image_save_taggle):
-        #         image_save_taggle -= inference_show_denoise_image_every_n_steps
-        #         image_list.append(detransform_tensor2image(x_t.detach().cpu()))        
+            # #保存过程图片
+            # if (inference_show_denoise_image_every_n_steps is not None) and (t < image_save_taggle):
+            #     image_save_taggle -= inference_show_denoise_image_every_n_steps
+            #     image_list.append(detransform_tensor2image(x_t.detach().cpu()))        
 
         #保存最终图片
         image = detransform_tensor2image(x_t.detach().cpu())

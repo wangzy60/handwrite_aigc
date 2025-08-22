@@ -118,3 +118,42 @@ def ldm_load_model(model_path, model):
     elif incompatiable.unexpected_keys:
         raise ValueError(f"多余的key：{incompatiable.unexpected_keys}")       
     return model
+
+
+def concatenate_images_horizontally(image_numpy_list):
+    assert len(image_numpy_list) > 0, "image_numpy_list不能为空"
+    image_num = len(image_numpy_list)
+
+    img_width = image_numpy_list[0].width
+    total_width = int(img_width * image_num)
+    max_height = image_numpy_list[0].height
+
+    new_image = Image.new('RGB', (total_width, max_height))
+
+    x_offset = 0
+    for img in image_numpy_list:
+        new_image.paste(img, (x_offset, 0))
+        x_offset += img_width
+    return new_image
+
+
+def concatenate_images_vertical(image_numpy_list):
+    if isinstance(image_numpy_list, list):
+        assert len(image_numpy_list) > 0, "image_numpy_list不能为空"
+        image_num = len(image_numpy_list)
+
+        img_height = image_numpy_list[0].height
+        total_height = int(img_height * image_num)
+        total_width = image_numpy_list[0].width
+
+        new_image = Image.new('RGB', (total_width, total_height))
+
+        x_offset = 0
+        for img in image_numpy_list:
+            new_image.paste(img, (0, x_offset))
+            x_offset += img_height
+        return new_image
+    elif image_numpy_list:
+        return image_numpy_list
+    else:
+        raise ValueError("输入不能为空")

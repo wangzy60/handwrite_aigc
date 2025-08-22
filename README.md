@@ -4,7 +4,7 @@ torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=123
 
 ### ddpm恢复训练
 
-torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=12345 train.py --mode multi_gpu_ddpm_train --resume_train --unet_ckpt_path ./project/20250803_090253_637954/checkpoints/least_epoch_ckpt.pth --input_image_size 128 --ddpm_dataset_fold ./dataset/flickr30kr/flickr30k_images_128/images --epochs 3000 --batch_size 45 --input_image_dims 3 --output_image_dims 3
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=12345 train.py --mode multi_gpu_ddpm_train --resume_train --unet_ckpt_path ./project/20250806_224403_435419/checkpoints/least_epoch_ckpt.pth --input_image_size 128 --ddpm_dataset_fold ./dataset/flickr30kr/flickr30k_images_128/images --epochs 3000 --batch_size 45 --input_image_dims 3 --output_image_dims 3
 
 ### ddpm 推理
 
