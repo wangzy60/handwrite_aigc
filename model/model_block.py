@@ -517,6 +517,10 @@ class image_multihead_attation_block(nn.Module):
         q = q.reshape(batch_size, seq, heads, latent_dim//heads).permute(0, 2, 1, 3) # b, h*w, c -> b, h*w, head, c//head -> b, head, h*w, c//head
         k = k.reshape(batch_size, seq, heads, latent_dim//heads).permute(0, 2, 1, 3)
         v = v.reshape(batch_size, seq, heads, latent_dim//heads).permute(0, 2, 1, 3)
+        #需要注意，torch.matmul在进行大于等于3维的矩阵乘法时，只有最后两个维度参与矩阵乘法，其他维度不参与矩阵乘法
+        #具体来说，对于A（2,3,4）和B（2,4,3）两个矩阵，使用torch.matmul进行计算，得到的结果的形状为C（2,3,3）
+        #这个计算是分两步得到的，首先算C[0] = A[0]@B[0]，然后计算C[1] = A[1]@B[1]，然后得到C
+        #如果是4维矩阵，例如（2,3,4,5），则2和3所在的维度都不参与矩阵乘法，依此类推
         attation_score = torch.matmul(q, k.permute(0, 1, 3, 2)) / torch.sqrt(torch.tensor(latent_dim//heads)) # b, head, h*w, h*w
         attation_score = F.softmax(attation_score, dim = -1) # b, head, h*w, h*w
         x = torch.matmul(attation_score, v) # b, head, h*w, h*w @ b, head, h*w, c//head -> b, head, h*w, c//head
